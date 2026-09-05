@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile, writeFile, appendFile, mkdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 
-import { binShim, cleanup, commitAll, git, run, tempDir, tempRepo } from './helpers.js';
+import { binShim, cleanup, commitAll, git, readAndAck, run, tempDir, tempRepo } from './helpers.js';
 
 after(cleanup);
 
@@ -32,7 +32,7 @@ describe('check — the gate', () => {
     const dir = await tempRepo();
     await seedNote(dir);
 
-    assert.equal((await run(dir, ['ack'])).code, 0);
+    assert.equal((await readAndAck(dir)).code, 0);
 
     const { code, stdout, stderr } = await run(dir, ['check']);
     assert.equal(code, 0);
@@ -43,7 +43,7 @@ describe('check — the gate', () => {
   it('re-triggers on a change and prints only the new lines', async () => {
     const dir = await tempRepo();
     await seedNote(dir);
-    await run(dir, ['ack']);
+    await readAndAck(dir);
 
     await appendFile(
       path.join(dir, NOTE),
@@ -56,18 +56,18 @@ describe('check — the gate', () => {
     assert.match(stderr, /Bumped the lockfile/);
     // The already-read section must not be reprinted.
     assert.doesNotMatch(stderr, /Migration 0042/);
-    assert.match(stderr, /4 new lines/);
+    assert.match(stderr, /3 new lines/);
   });
 
   it('refuses when acknowledged content is rewritten rather than appended', async () => {
     const dir = await tempRepo();
     await seedNote(dir);
-    await run(dir, ['ack']);
+    await readAndAck(dir);
     await writeFile(path.join(dir, NOTE), '## 2026-01-02 — feat/payments\n', 'utf8');
 
     const { code, stderr } = await run(dir, ['check']);
     assert.equal(code, 1);
-    assert.match(stderr, /removed or rewritten/);
+    assert.match(stderr, /changed or removed/);
   });
 
   it('exits 0 silently when there is no git working copy', async () => {
@@ -92,7 +92,7 @@ describe('check — the gate', () => {
     const origin = await tempRepo();
     await seedNote(origin);
     await commitAll(origin, 'add note');
-    assert.equal((await run(origin, ['ack'])).code, 0);
+    assert.equal((await readAndAck(origin)).code, 0);
     assert.equal((await run(origin, ['check'])).code, 0);
 
     const clones = await tempDir();
@@ -107,7 +107,7 @@ describe('check — the gate', () => {
   it('never writes the acknowledgement into the working tree', async () => {
     const dir = await tempRepo();
     await seedNote(dir);
-    await run(dir, ['ack']);
+    await readAndAck(dir);
 
     const tracked = await git(dir, ['status', '--porcelain']);
     assert.equal(tracked, `?? ${NOTE}`);
@@ -204,7 +204,7 @@ describe('install-hook', () => {
     const { code } = await run(dir, ['install-hook', '--hook', 'pre-commit']);
     assert.equal(code, 0);
     const body = await readFile(path.join(dir, '.git', 'hooks', 'pre-commit'), 'utf8');
-    assert.match(body, /pairwarn_gate \|\| exit 1/);
+    assert.match(body, /pairwarn_gate check \|\| exit 1/);
   });
 
   it('actually refuses a real git push until the note is acknowledged', async () => {
@@ -241,7 +241,7 @@ describe('install-hook', () => {
     assert.notEqual(blocked.code, 0, 'push is refused while the note is unread');
     assert.match(blocked.stderr, /Migration 0042/);
 
-    assert.equal((await run(work, ['ack'])).code, 0);
+    assert.equal((await readAndAck(work)).code, 0);
 
     const allowed = await push();
     assert.equal(allowed.code, 0, `push should succeed after ack: ${allowed.stderr}`);
@@ -257,7 +257,7 @@ describe('init', () => {
     assert.match(stdout, /created conversation\.md/);
     assert.match(stdout, /"test": "pairwarn check && /);
     assert.match(stdout, /AGENTS\.md, CLAUDE\.md, CONTRIBUTING\.md/);
-    assert.match(stdout, /Skipping the hook/);
+    assert.match(stdout, /Skipping the hooks/);
 
     assert.equal((await run(dir, ['check'])).code, 0, 'init acknowledges what it wrote');
   });
@@ -269,6 +269,7 @@ describe('init', () => {
     const { stdout } = await run(dir, ['init', '--yes']);
     assert.match(stdout, /already exists — left untouched/);
     assert.match(stdout, /wrote pre-push hook/);
+    assert.match(stdout, /wrote prepare-commit-msg hook/);
     assert.equal(await readFile(path.join(dir, NOTE), 'utf8'), '# my own header\n');
   });
 });
@@ -283,7 +284,7 @@ describe('note file selection', () => {
 
     const env = { NOTE_FILE: 'docs/handoff.md' };
     assert.equal((await run(dir, ['check'], { env })).code, 1);
-    assert.equal((await run(dir, ['ack'], { env })).code, 0);
+    assert.equal((await readAndAck(dir, { env })).code, 0);
     assert.equal((await run(dir, ['check'], { env })).code, 0);
 
     assert.equal((await run(dir, ['check', '--file', 'docs/handoff.md'])).code, 0);

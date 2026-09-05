@@ -26,3 +26,20 @@ session here could trip over:
 - `.git/pairwarn/` holds each working copy's acknowledgement. If you are
   debugging the gate and want to see a first-read refusal again, delete that
   directory — never add an "unack" command to work around it.
+
+## 2026-09-05 — claude/agent-coordination-cli-6lsozy
+
+Enforcement layers landed (0.2.0). Read this before touching the gate logic.
+
+- `ack` now needs the token `check` prints. If you are scripting against this
+  tool, `ack` with no argument only succeeds when nothing is unread.
+- `git commit --no-verify` does NOT skip `prepare-commit-msg`. Verified
+  empirically, and there is a test locking it down. Do not "simplify" the
+  stamping hook into `pre-commit` — that one IS skipped by --no-verify.
+- `classifyChange` in src/core.js has two bugs' worth of scar tissue: sections
+  must have trailing blanks trimmed before comparison, and the empty-tail
+  overlap case must NOT be allowed (it made a rewritten section look like
+  "archived, then appended"). Both have tests. Do not relax either.
+- This repo still does not run `verify` in its own CI: the first commit predates
+  the trailer, so it has none. Either start the audit range after that commit or
+  leave it off until the package ships.

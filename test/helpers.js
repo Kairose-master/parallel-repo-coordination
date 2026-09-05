@@ -68,6 +68,19 @@ export async function binShim(dir) {
   return file;
 }
 
+/** The token `check` prints, or null when there is nothing to acknowledge. */
+export async function ackToken(cwd, opts = {}) {
+  const { stderr } = await run(cwd, ['check'], opts);
+  const match = /ack ([0-9a-f]{12})/.exec(stderr);
+  return match ? match[1] : null;
+}
+
+/** Read the note the way a person would, then acknowledge it. */
+export async function readAndAck(cwd, opts = {}) {
+  const token = await ackToken(cwd, opts);
+  return run(cwd, token ? ['ack', token] : ['ack'], opts);
+}
+
 export async function cleanup() {
   await Promise.all(made.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 }

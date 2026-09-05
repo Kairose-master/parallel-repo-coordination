@@ -1,6 +1,6 @@
 {
   "name": "pairwarn",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Nobody pushes until they have read the shared note. A zero-dependency refusal gate for repositories worked on by more than one agent or human at a time.",
   "type": "module",
   "bin": {

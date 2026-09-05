@@ -10,8 +10,17 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { BIN_NAME, DEFAULT_NOTE_FILE } from '../src/core.js';
-import { ack, check, init, installHookCommand, note } from '../src/commands.js';
+import { BIN_NAME, DEFAULT_NOTE_FILE, TRAILER_KEY } from '../src/core.js';
+import { ack, archive, check, init, installHookCommand, note, stamp, verify } from '../src/commands.js';
+
+// A CLI gets piped into `head`, `grep -q`, and git hooks that stop reading.
+// Swallow the closed pipe so writes become no-ops — but never exit here: a
+// gate whose refusal is truncated must still refuse, not fail open.
+for (const stream of [process.stdout, process.stderr]) {
+  stream.on('error', (error) => {
+    if (!error || error.code !== 'EPIPE') throw error;
+  });
+}
 
 const HELP = `${BIN_NAME} — nobody pushes until they have read the shared note.
 
@@ -20,13 +29,25 @@ usage: npx ${BIN_NAME} <command> [options]
 commands:
   check                 Refuse (exit 1) until the note file has been read in
                         this working copy, printing only what is new since
-                        your last read. Exits 0 when clean, and exits 0
-                        silently when there is no git working copy at all.
-  ack                   Record the note file as read, here, now.
+                        your last read plus the token that clears it. Exits 0
+                        when clean, and exits 0 silently when there is no git
+                        working copy at all.
+  ack <token>           Record the note file as read. The token comes from
+                        \`check\`, so content you were never shown cannot be
+                        acknowledged blind.
   note "<text>"         Append a dated, branch-stamped section to the note
                         file and acknowledge it. Reads stdin if no text given.
-  install-hook          Write or extend a git hook that runs \`check\`.
-                        Idempotent. Defaults to pre-push.
+  stamp                 Print the ${TRAILER_KEY} trailer for the current note,
+                        or write it into a commit message with --commit-msg.
+  verify                Audit commits: every commit must carry the digest of
+                        the note file as it stood in that commit. This is the
+                        enforceable check — run it in CI. A local hook is a
+                        courtesy that --no-verify skips and anyone can delete.
+  archive               Move sections older than --older-than days into a
+                        sibling archive file, so the active note stays short
+                        enough that people finish reading it.
+  install-hook          Write or extend a git hook. Idempotent. Defaults to
+                        pre-push; --hook prepare-commit-msg adds the trailer.
   init                  Create the note file, print the wiring you need, and
                         offer to install the hook.
 
@@ -34,8 +55,12 @@ options:
   --file <path>         Note file to use (default: ${DEFAULT_NOTE_FILE};
                         also settable with the NOTE_FILE env var).
   --hook <name>         install-hook: which hook to write (default pre-push).
-  -y, --yes             init: install the hook without asking.
-  --no-hook             init: do not install the hook.
+  --commit-msg <file>   stamp: write the trailer into this commit message file.
+  --base <ref>          verify: audit <ref>..HEAD (default HEAD~1). In CI use
+                        the base branch, e.g. --base origin/main.
+  --older-than <days>   archive: age cutoff in days (default 30).
+  -y, --yes             init: install the hooks without asking.
+  --no-hook             init: do not install any hook.
   -h, --help            Show this help.
   -v, --version         Show the version.
 
@@ -57,6 +82,9 @@ function parse(argv) {
       case '-v': case '--version': opts.version = true; break;
       case '--file': case '--note-file': opts.file = value(); break;
       case '--hook': opts.hookName = value(); break;
+      case '--commit-msg': case '--commit-msg-file': opts.commitMsg = value(); break;
+      case '--base': opts.base = value(); break;
+      case '--older-than': case '--days': opts.days = Number(value()); break;
       case '-y': case '--yes': opts.yes = true; break;
       case '--no-hook': opts.noHook = true; break;
       default:
@@ -105,11 +133,17 @@ async function main(argv) {
     case 'check':
       return check(base);
     case 'ack':
-      return ack(base);
+      return ack(opts._[1], base);
     case 'note': {
       const text = opts._.slice(1).join(' ') || (await readStdin());
       return note(text, base);
     }
+    case 'stamp':
+      return stamp({ ...base, commitMsg: opts.commitMsg });
+    case 'verify':
+      return verify({ ...base, base: opts.base });
+    case 'archive':
+      return archive({ ...base, days: opts.days });
     case 'install-hook':
       return installHookCommand({ ...base, hook: opts.hookName || 'pre-push' });
     case 'init':

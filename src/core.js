@@ -9,6 +9,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readFile, writeFile, mkdir, chmod, stat } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 
 const exec = promisify(execFile);
@@ -19,6 +20,8 @@ export const ACK_DIR_NAME = 'pairwarn';
 export const HOOK_MARKER_START = `# >>> ${BIN_NAME} >>>`;
 export const HOOK_MARKER_END = `# <<< ${BIN_NAME} <<<`;
 export const MAX_PRINTED_LINES = 200;
+export const TRAILER_KEY = 'Note-Ack';
+export const DIGEST_LENGTH = 12;
 
 /** Header written into a brand new note file by `init` / first `note`. */
 export const NOTE_HEADER = `# Shared working notes
@@ -29,11 +32,14 @@ another session could trip over. Files being rewritten wholesale, migrations in
 flight, assumptions that are about to stop being true.
 
     npx ${BIN_NAME} check           # refuses until this file has been read here
-    npx ${BIN_NAME} ack             # records that you have read it
+    npx ${BIN_NAME} ack <token>     # the token comes from check, so you cannot
+                                    # clear text you were never shown
     npx ${BIN_NAME} note "..."      # append a section (writing is also reading)
 
 The acknowledgement is stored in .git/ and is never committed, so a fresh clone
-is a fresh reader. Append at the bottom; do not rewrite history above.
+is a fresh reader. Append at the bottom; do not rewrite history above — the
+gate treats a rewrite of acknowledged text as unread. Use \`${BIN_NAME} archive\`
+to retire old sections instead.
 `;
 
 /* ------------------------------------------------------------------ git --- */
@@ -41,6 +47,12 @@ is a fresh reader. Append at the bottom; do not rewrite history above.
 async function git(args, cwd) {
   const { stdout } = await exec('git', args, { cwd, encoding: 'utf8' });
   return stdout.trim();
+}
+
+/** Run git and return stdout, untrimmed on request. Throws on non-zero exit. */
+export async function gitOutput(args, cwd, { trim = true } = {}) {
+  const { stdout } = await exec('git', args, { cwd, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
+  return trim ? stdout.trim() : stdout;
 }
 
 /**
@@ -135,9 +147,7 @@ export function splitLines(text) {
 
 /**
  * Lines present in `current` after the longest common prefix it shares with
- * `previous`. For an append-only file this is exactly what was appended; for
- * an edited file it is everything from the first divergence, which is the
- * honest conservative answer.
+ * `previous`. Used as the fallback when the file is not section-structured.
  */
 export function newLines(previous, current) {
   const prev = splitLines(previous);
@@ -145,6 +155,150 @@ export function newLines(previous, current) {
   let i = 0;
   while (i < prev.length && i < cur.length && prev[i] === cur[i]) i += 1;
   return cur.slice(i);
+}
+
+/** Short content digest. Drives the ack token and the commit trailer. */
+export function digest(content) {
+  return createHash('sha256').update(content ?? '', 'utf8').digest('hex').slice(0, DIGEST_LENGTH);
+}
+
+/** Drop trailing blank lines so a section compares equal whether or not it is
+ *  the last one in the file — appending below a section must not "change" it. */
+function trimTrailingBlanks(lines) {
+  let end = lines.length;
+  while (end > 0 && lines[end - 1].trim() === '') end -= 1;
+  return lines.slice(0, end);
+}
+
+/** Split a note file into its leading header and its `## ` sections. */
+export function splitSections(text) {
+  const lines = splitLines(text);
+  const starts = [];
+  lines.forEach((line, i) => { if (/^## /.test(line)) starts.push(i); });
+  if (starts.length === 0) return { header: trimTrailingBlanks(lines), sections: [] };
+  const sections = starts.map((start, n) => {
+    const end = n + 1 < starts.length ? starts[n + 1] : lines.length;
+    return trimTrailingBlanks(lines.slice(start, end));
+  });
+  return { header: trimTrailingBlanks(lines.slice(0, starts[0])), sections };
+}
+
+const sameLines = (a, b) => a.length === b.length && a.every((line, i) => line === b[i]);
+
+/**
+ * Classify how `current` differs from the acknowledged snapshot:
+ *
+ *   first      — never acknowledged here; everything is new
+ *   clean      — byte-identical
+ *   archived   — only already-read sections were removed from the top; the
+ *                reader has seen everything that remains, so this passes
+ *   appended   — sections were added (and possibly old ones archived)
+ *   rewritten  — acknowledged content was changed or removed mid-file
+ */
+export function classifyChange(acked, current) {
+  if (acked === null || acked === undefined) {
+    return { kind: 'first', added: splitLines(current) };
+  }
+  if (acked === current) return { kind: 'clean', added: [] };
+
+  const a = splitSections(acked);
+  const c = splitSections(current);
+
+  if (sameLines(a.header, c.header)) {
+    // Find the smallest k where the current sections begin with acked[k..]:
+    // k old sections were archived off the top and every survivor still matches
+    // byte for byte. The tail must be non-empty — an empty one matches anything,
+    // which would let a rewritten section pass as "archived, then appended".
+    for (let k = 0; k < a.sections.length; k += 1) {
+      const tail = a.sections.slice(k);
+      if (tail.length > c.sections.length) continue;
+      const overlaps = tail.every((section, i) => sameLines(section, c.sections[i]));
+      if (!overlaps) continue;
+      const fresh = c.sections.slice(tail.length);
+      if (fresh.length === 0) return { kind: 'archived', added: [] };
+      return { kind: 'appended', added: fresh.flat(), archived: k };
+    }
+    // Everything acknowledged was archived away and nothing took its place.
+    if (a.sections.length > 0 && c.sections.length === 0) {
+      return { kind: 'archived', added: [] };
+    }
+  }
+
+  const added = newLines(acked, current);
+  return { kind: added.length ? 'appended' : 'rewritten', added };
+}
+
+/* -------------------------------------------------------------- trailer --- */
+
+/** Read the `Note-Ack:` trailer out of a commit message. */
+export function readTrailer(message) {
+  const re = new RegExp(`^${TRAILER_KEY}:[ \\t]*([0-9a-f]+)[ \\t]*$`, 'im');
+  const match = re.exec(message ?? '');
+  return match ? match[1] : null;
+}
+
+export function trailerLine(value) {
+  return `${TRAILER_KEY}: ${value}`;
+}
+
+/**
+ * Append the trailer to a commit message body, after the last non-comment,
+ * non-blank line. Idempotent: an existing trailer is replaced.
+ */
+export function applyTrailer(message, value) {
+  const lines = (message ?? '').split('\n');
+  const kept = [];
+  let replaced = false;
+  for (const line of lines) {
+    if (new RegExp(`^${TRAILER_KEY}:`, 'i').test(line)) {
+      if (!replaced) { kept.push(trailerLine(value)); replaced = true; }
+      continue;
+    }
+    kept.push(line);
+  }
+  if (replaced) return kept.join('\n');
+
+  let last = kept.length - 1;
+  while (last >= 0 && (kept[last].trim() === '' || kept[last].startsWith('#'))) last -= 1;
+  const body = kept.slice(0, last + 1);
+  const rest = kept.slice(last + 1);
+  const needsBlank = body.length > 0 && body[body.length - 1].trim() !== '';
+  return [...body, ...(needsBlank ? [''] : []), trailerLine(value), ...rest].join('\n');
+}
+
+/* -------------------------------------------------------------- archive --- */
+
+export function archiveFileName(noteName) {
+  const ext = path.extname(noteName);
+  const base = ext ? noteName.slice(0, -ext.length) : noteName;
+  return `${base}.archive${ext || '.md'}`;
+}
+
+export function sectionDate(section) {
+  const match = /^## (\d{4}-\d{2}-\d{2})\b/.exec(section[0] ?? '');
+  return match ? match[1] : null;
+}
+
+/**
+ * Split sections into those older than `cutoff` (YYYY-MM-DD) and those kept.
+ * Sections without a parseable date are always kept — never guess.
+ */
+export function partitionByAge(content, cutoff) {
+  const { header, sections } = splitSections(content);
+  const old = [];
+  const keep = [];
+  for (const section of sections) {
+    const date = sectionDate(section);
+    if (date && date < cutoff) old.push(section);
+    else keep.push(section);
+  }
+  return { header, old, keep };
+}
+
+export function joinNote(header, sections) {
+  const parts = [header.join('\n').replace(/\s+$/, '')];
+  for (const section of sections) parts.push(section.join('\n').replace(/\s+$/, ''));
+  return `${parts.filter((p) => p !== '').join('\n\n')}\n`;
 }
 
 /** Record the current note content as read, in this working copy only. */
@@ -192,27 +346,35 @@ export function appendSection(existing, section) {
 
 /* ----------------------------------------------------------------- hook --- */
 
-export function hookBlock() {
+/** What each supported hook should invoke. */
+export function hookCommand(hookName) {
+  if (hookName === 'prepare-commit-msg') return `stamp --commit-msg "$1"`;
+  return 'check';
+}
+
+export function hookBlock(hookName = 'pre-push') {
+  const invocation = hookCommand(hookName);
   return [
     HOOK_MARKER_START,
     `# Managed by \`${BIN_NAME} install-hook\`. Delete this block to remove the gate.`,
-    `# Refuses the push until the shared note file has been read in THIS working copy.`,
+    `# A local hook lives in .git/ and anyone can delete it, so it is a courtesy,`,
+    `# not enforcement. \`${BIN_NAME} verify\` in CI is what actually enforces this.`,
     `${BIN_NAME}_gate() {`,
     `  root=$(git rev-parse --show-toplevel 2>/dev/null) || return 0`,
     `  if [ -n "$PAIRWARN_BIN" ]; then`,
-    `    "$PAIRWARN_BIN" check`,
+    `    "$PAIRWARN_BIN" "$@"`,
     `  elif [ -x "$root/node_modules/.bin/${BIN_NAME}" ]; then`,
-    `    "$root/node_modules/.bin/${BIN_NAME}" check`,
+    `    "$root/node_modules/.bin/${BIN_NAME}" "$@"`,
     `  elif command -v ${BIN_NAME} >/dev/null 2>&1; then`,
-    `    ${BIN_NAME} check`,
+    `    ${BIN_NAME} "$@"`,
     `  elif command -v npx >/dev/null 2>&1; then`,
-    `    npx --yes ${BIN_NAME} check`,
+    `    npx --yes ${BIN_NAME} "$@"`,
     `  else`,
     `    echo "${BIN_NAME}: not installed; skipping the shared-note gate" >&2`,
     `    return 0`,
     `  fi`,
     `}`,
-    `${BIN_NAME}_gate || exit 1`,
+    `${BIN_NAME}_gate ${invocation} || exit 1`,
     HOOK_MARKER_END,
     '',
   ].join('\n');
@@ -228,12 +390,12 @@ export async function installHook(dir, hookName = 'pre-push') {
     return { action: 'already-installed', file };
   }
   if (current === null) {
-    await writeFile(file, `#!/bin/sh\n# git ${hookName} hook\n\n${hookBlock()}`, 'utf8');
+    await writeFile(file, `#!/bin/sh\n# git ${hookName} hook\n\n${hookBlock(hookName)}`, 'utf8');
     await chmod(file, 0o755);
     return { action: 'created', file };
   }
   const sep = current.endsWith('\n') ? '\n' : '\n\n';
-  await writeFile(file, `${current}${sep}${hookBlock()}`, 'utf8');
+  await writeFile(file, `${current}${sep}${hookBlock(hookName)}`, 'utf8');
   await chmod(file, 0o755).catch(() => {});
   return { action: 'appended', file };
 }

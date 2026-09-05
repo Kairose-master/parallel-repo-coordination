@@ -84,7 +84,7 @@ pairwarn: refusing — conversation.md has not been read in this working copy.
 
 Read the above, then record it:
 
-    npx pairwarn ack
+    npx pairwarn ack 70b402fa66fa
 ```
 
 ## Commands
@@ -92,16 +92,94 @@ Read the above, then record it:
 | Command | What it does |
 | --- | --- |
 | `pairwarn check` | The gate. Exit 1 with the new lines if the note file is unread here; exit 0 silently if it is clean, empty, missing, or there is no git working copy at all. |
-| `pairwarn ack` | Record the note file as read, in this working copy. |
+| `pairwarn ack <token>` | Record the note file as read. The token is printed by `check`, below the text it shows you. |
 | `pairwarn note "<text>"` | Append a dated, branch-stamped section and acknowledge it — writing a note is reading it. Reads stdin when given no text. |
 | `pairwarn install-hook` | Write or extend a git hook that runs `check`. Idempotent; defaults to `pre-push`, `--hook <name>` for any other. |
-| `pairwarn init` | Create the note file, print the wiring you need, and offer to install the hook. |
+| `pairwarn stamp` | Print the `Note-Ack` trailer for the current note, or write it into a commit message with `--commit-msg <file>`. |
+| `pairwarn verify` | Audit `<base>..HEAD`: every commit must carry the digest of the note file as it stood in that commit. Run this in CI. |
+| `pairwarn archive` | Move sections older than `--older-than <days>` (default 30) into a sibling archive file. |
+| `pairwarn init` | Create the note file, print the wiring you need, and offer to install the hooks. |
 
 Options: `--file <path>` (or the `NOTE_FILE` environment variable) to use a note
-file other than `conversation.md`; `-y/--yes` and `--no-hook` for `init`;
-`--help`, `--version`.
+file other than `conversation.md`; `--base <ref>` for `verify`; `--commit-msg
+<file>` for `stamp`; `--older-than <days>` for `archive`; `-y/--yes` and
+`--no-hook` for `init`; `--help`, `--version`.
 
 Exit codes: **0** clean · **1** refused, notes unread · **2** usage error.
+
+## What actually stops someone who does not want to be stopped
+
+A gate that only lives in a git hook is a suggestion. `.git/hooks/` is not
+committed, anyone can delete it, and `git push --no-verify` walks straight past
+`pre-push`. Pretending otherwise would make this tool a placebo, so it is built
+in layers and each one is honest about its reach.
+
+| Layer | Stops | Does not stop |
+| --- | --- | --- |
+| `check` in a `pre-push` hook | The ordinary case: you pull, a warning arrived, you push without reading | `git push --no-verify`; a deleted hook |
+| `stamp` in a `prepare-commit-msg` hook | Committing without acknowledging — and **`git commit --no-verify` does not skip this hook**, unlike `pre-commit` | A deleted hook |
+| `verify` in CI | Everything above, because it reads the commits themselves rather than trusting the working copy | Nothing, if the CI job is required |
+| The ack token | Clearing a warning you were never shown | Someone who reads the text and ignores it |
+
+The load-bearing piece is the commit trailer. `ack` records the note in `.git/`,
+which CI cannot see — so `stamp` also writes a digest of the note into the
+commit message:
+
+```
+Fix the payment retry loop
+
+Note-Ack: 70b402fa66fa
+```
+
+`verify` then checks, for every commit in a range, that the trailer matches the
+note file **as it stood in that commit**. A commit made with the hooks deleted
+has no trailer. A commit that reused an old digest has a stale one. Both fail:
+
+```
+pairwarn: 1 commit in a1b2c3d..HEAD did not acknowledge conversation.md.
+
+  bc05e757  bypassed the gate entirely
+      expected Note-Ack: 70b402fa66fa
+      no Note-Ack trailer (hook skipped, bypassed, or removed)
+```
+
+Make that job a required status check and the loop closes: the local hooks stay
+a convenience, and the thing nobody can skip is the one doing the enforcing.
+
+### Why `ack` takes a token
+
+`check` prints the token *after* the note text, and `ack` refuses without it:
+
+```
+$ pairwarn ack
+pairwarn: conversation.md has unread changes — acknowledge them by token.
+
+    npx pairwarn check      # shows what is new, and prints the token
+    npx pairwarn ack <token>
+
+A bare `ack` cannot clear content you have not been shown.
+```
+
+This does not prove comprehension — nothing can, and this tool will not pretend
+to. What it guarantees is narrower and is exactly what failed in the story
+above: the token cannot be produced unless the warning text passed in front of
+the reader. A note sitting unread on screen no longer clears the gate.
+
+### Keeping the note readable
+
+A note file that only grows becomes the unread wall it was meant to replace.
+`pairwarn archive` moves sections older than 30 days into
+`conversation.archive.md`:
+
+```sh
+npx pairwarn archive --older-than 30
+```
+
+Other working copies do **not** get a re-read prompt for this. `check` compares
+section by section: when the only change is that already-acknowledged sections
+disappeared from the top, it advances silently. Rewriting or deleting a section
+someone has *not* read still refuses — quietly editing a warning out from under
+somebody is the failure mode, not the fix.
 
 ## How the acknowledgement works
 
@@ -173,36 +251,31 @@ if you want it automatic.
 
 ### 3. GitHub Actions
 
-The gate belongs in **jobs that push**, which on CI means automation and agent
+This is where the gate stops being optional. `verify` reads the commits, not the
+working copy, so it works on a fresh CI checkout where no acknowledgement exists:
+
+```yaml
+name: pairwarn
+on: pull_request
+
 jobs:
-
-```yaml
-- name: Refuse to push over an unread note
-  run: npx pairwarn check
+  notes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0            # verify needs the base branch's history
+      - run: npx pairwarn verify --base origin/${{ github.base_ref }}
 ```
 
-Be deliberate about this one. A fresh CI checkout has no acknowledgement, so on
-an ordinary human pull-request build `check` would fail every time by design —
-that is the correct behaviour for a *working copy*, and useless as a PR status.
-Use it in a job where the runner is itself the working copy doing the work
-(an automation job that commits and pushes), and rely on the pre-push hook for
-everyone else.
+Make it a required status check. Every commit on the branch must then carry the
+digest of the note file as it stood in that commit — which is only true if
+somebody acknowledged it before committing.
 
-If you also want a PR-level rule, this needs no extra tooling — fail a PR that
-touches shared surface without leaving a note:
-
-```yaml
-- name: Require a note for changes to shared surface
-  run: |
-    base="origin/${{ github.base_ref }}"
-    git fetch -q origin "${{ github.base_ref }}"
-    changed=$(git diff --name-only "$base"...HEAD)
-    echo "$changed" | grep -qE '^(src/db/|src/api/)' || exit 0
-    echo "$changed" | grep -qx 'conversation.md' || {
-      echo "Shared surface changed without a note. Run: npx pairwarn note \"...\""
-      exit 1
-    }
-```
+Note that `check` is the wrong command for a human pull-request build: a fresh
+checkout has no acknowledgement, so `check` would fail every time by design.
+`check` gates *working copies*; `verify` gates *history*. Use `check` in hooks
+and local scripts, `verify` in CI.
 
 ## What goes in a note
 
@@ -224,8 +297,9 @@ Commit the note file. It is only useful because it arrives with the code.
 ## Design constraints
 
 - **Zero runtime dependencies.** Node built-ins only (`fs/promises`,
-  `child_process`, `path`, `url`, `util`). This runs in every contributor's
-  pre-push path; it must not be a supply-chain liability itself.
+  `child_process`, `crypto`, `path`, `url`, `util`). This runs in every
+  contributor's commit and push path; it must not be a supply-chain liability
+  itself.
 - **Agent-agnostic.** It is a CLI. A human, a shell script, a CI job, or any
   coding agent that can run a command before committing uses it identically.
 - **No intelligence anywhere in it.** No model, no summarisation, no heuristic
