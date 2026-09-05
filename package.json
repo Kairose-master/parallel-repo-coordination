@@ -1,0 +1,45 @@
+{
+  "name": "pairwarn",
+  "version": "0.1.0",
+  "description": "Nobody pushes until they have read the shared note. A zero-dependency refusal gate for repositories worked on by more than one agent or human at a time.",
+  "type": "module",
+  "bin": {
+    "pairwarn": "bin/cli.js"
+  },
+  "exports": {
+    ".": "./src/core.js"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "gate": "node bin/cli.js check"
+  },
+  "keywords": [
+    "git",
+    "hooks",
+    "pre-push",
+    "coordination",
+    "concurrency",
+    "agents",
+    "handoff",
+    "cli"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Kairose-master/parallel-repo-coordination.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Kairose-master/parallel-repo-coordination/issues"
+  },
+  "homepage": "https://github.com/Kairose-master/parallel-repo-coordination#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ]
+}
